@@ -365,38 +365,42 @@
   drawStars();
 
   /* ===================== storage (throttled to avoid rate errors) ===================== */
-  const LEADERBOARD_KEY = 'wordfall:leaderboard';
-  const LEADERBOARD_SPEED_KEY = 'wordfall:leaderboard_speed';
-  const NAME_KEY = 'wordfall:playerName';
-  const ECONOMY_KEY = 'wordfall:economy';
+  /* leaderboard keys now live server-side under /api/leaderboard/score and /api/leaderboard/speed */
+  const NAME_KEY = 'wordfall_playerName';
+  const ECONOMY_KEY = 'wordfall_economy';
 
   function dedupeBest(list){
     const byName = new Map();
     for(const entry of list){ const existing = byName.get(entry.name); if(!existing || entry.score>existing.score) byName.set(entry.name, entry); }
     return Array.from(byName.values()).sort((a,b)=> b.score - a.score);
   }
-  async function loadLeaderboardFrom(key){
-    try{ const res = await window.storage.get(key, true);
-      if(res && res.value){ const parsed = JSON.parse(res.value); if(Array.isArray(parsed)) return dedupeBest(parsed); } }catch(e){}
+  /* Global leaderboard now lives on the real backend (server.js), reachable
+     at same-origin /api/leaderboard/<type>. This works on any real browser,
+     unlike the old artifact-only window.storage API. */
+  async function loadLeaderboardFrom(type){
+    try{
+      const res = await fetch('/api/leaderboard/'+type);
+      if(res.ok){ const list = await res.json(); if(Array.isArray(list)) return dedupeBest(list); }
+    }catch(e){ console.error('leaderboard fetch failed', e); }
     return [];
   }
-  async function saveToLeaderboard(key, name, score, extra){
-    let list = await loadLeaderboardFrom(key);
-    const existing = list.find(e=>e.name===name);
-    if(existing){ if(score>existing.score){ existing.score=score; existing.extra=extra; existing.ts=Date.now(); } }
-    else list.push({name:name.slice(0,16), score, extra, ts:Date.now()});
-    list = dedupeBest(list).slice(0,50);
-    await safeStorageSet(key, JSON.stringify(list), true);
-    return list;
+  async function saveToLeaderboard(type, name, score, extra){
+    try{
+      const res = await fetch('/api/leaderboard/'+type, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ name, score, extra })
+      });
+      if(res.ok) return await res.json();
+    }catch(e){ console.error('leaderboard save failed', e); }
+    return null;
   }
-  async function loadLeaderboard(){ return loadLeaderboardFrom(LEADERBOARD_KEY); }
-  async function saveScore(name, score, wave){ return saveToLeaderboard(LEADERBOARD_KEY, name, score, wave); }
-  async function saveSpeed(name, wpm){ return saveToLeaderboard(LEADERBOARD_SPEED_KEY, name, Math.round(wpm*10)/10, null); }
+  async function loadLeaderboard(){ return loadLeaderboardFrom('score'); }
+  async function saveScore(name, score, wave){ return saveToLeaderboard('score', name, score, wave); }
+  async function saveSpeed(name, wpm){ return saveToLeaderboard('speed', name, Math.round(wpm*10)/10, null); }
 
   let boardMode = 'score';
   async function renderLeaderboard(highlightName){
-    const key = boardMode==='score' ? LEADERBOARD_KEY : LEADERBOARD_SPEED_KEY;
-    const list = await loadLeaderboardFrom(key);
+    const list = await loadLeaderboardFrom(boardMode);
     const ul = document.getElementById('boardList'); const empty = document.getElementById('boardEmpty');
     ul.innerHTML='';
     if(list.length===0){ empty.classList.remove('hidden'); return; }
@@ -409,37 +413,31 @@
       li.querySelector('.name').textContent = entry.name; ul.appendChild(li);
     });
   }
-  async function loadSavedName(){
-    try{ const res = await window.storage.get(NAME_KEY, false); if(res && res.value) return res.value; }catch(e){}
-    return null;
+
+  /* Name & coins/skins are per-device — localStorage is the correct tool for
+     that on a real deployed site (it persists in this browser until the user
+     clears site data), and needs no invasive device-fingerprinting. */
+  function loadSavedName(){
+    try{ return localStorage.getItem(NAME_KEY); }catch(e){ return null; }
   }
-  async function saveNameForever(name){ try{ await window.storage.set(NAME_KEY, name, false); }catch(e){ console.error(e); } }
+  function saveNameForever(name){
+    try{ localStorage.setItem(NAME_KEY, name); }catch(e){ console.error('no se pudo guardar el nombre', e); }
+  }
 
   let economy = { coins:0, owned:['default'], selected:'default' };
-  async function loadEconomy(){
-    try{ const res = await window.storage.get(ECONOMY_KEY, false);
-      if(res && res.value){ const parsed = JSON.parse(res.value);
+  function loadEconomy(){
+    try{
+      const raw = localStorage.getItem(ECONOMY_KEY);
+      if(raw){ const parsed = JSON.parse(raw);
         if(parsed && typeof parsed.coins==='number'){ economy = parsed; if(!economy.owned) economy.owned=['default']; if(!economy.selected) economy.selected='default'; } }
-    }catch(e){}
+    }catch(e){ console.error('no se pudo leer la economia', e); }
   }
-  /* THROTTLED SAVE: saving on every single kill caused "Internal server error" spam.
-     Now we only persist economy: at wave transitions, at game end, and on shop actions. */
   let economyDirty = false;
-  let lastEconomySaveTs = 0;
-  async function safeStorageSet(key, value, shared, retries){
-    retries = retries===undefined ? 1 : retries;
-    try{ await window.storage.set(key, value, shared); return true; }
-    catch(e){
-      if(retries>0){ await new Promise(r=>setTimeout(r,600)); return safeStorageSet(key,value,shared,retries-1); }
-      console.error('storage set failed for', key, e); return false;
-    }
-  }
-  async function flushEconomy(){
+  function flushEconomy(){
     if(!economyDirty) return;
-    const now = Date.now();
-    if(now - lastEconomySaveTs < 2000){ setTimeout(flushEconomy, 2000-(now-lastEconomySaveTs)); return; }
-    economyDirty = false; lastEconomySaveTs = now;
-    await safeStorageSet(ECONOMY_KEY, JSON.stringify(economy), false);
+    economyDirty = false;
+    try{ localStorage.setItem(ECONOMY_KEY, JSON.stringify(economy)); }
+    catch(e){ console.error('no se pudo guardar la economia', e); }
   }
   function markEconomyDirty(){ economyDirty = true; }
 
@@ -926,8 +924,8 @@
   }
 
   (async function init(){
-    savedName = await loadSavedName();
-    await loadEconomy();
+    savedName = loadSavedName();
+    loadEconomy();
     if(savedName) unlockAllIfRavneet();
     runIntro(async ()=>{ if(savedName) goToMenu(); else showScreen('chooseName'); });
   })();
